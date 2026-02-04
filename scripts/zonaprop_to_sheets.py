@@ -1,18 +1,27 @@
-import os, re, json, time, hashlib
+# scripts/zonaprop_to_sheets.py
+import os
+import re
+import json
+import time
+import random
+import hashlib
 from datetime import datetime, timezone
-import requests
 from xml.etree import ElementTree as ET
+
+import requests
 from bs4 import BeautifulSoup
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-SITEMAP_INDEX = "https://www.zonaprop.com.ar/robots.txt"
-UA = os.getenv("UA", "Mozilla/5.0 (property-tracker/1.0)")
-HEADERS = {"User-Agent": UA}
+# =========================
+# Config
+# =========================
+SHEET_ID = os.getenv("SHEET_ID")  # your sheet id
+SITEMAP_INDEX = "https://www.zonaprop.com.ar/sitemaps_https.xml"
+ROBOTS_URL = "https://www.zonaprop.com.ar/robots.txt"
 
-SHEET_ID = os.getenv("SHEET_ID")
 MAX_USD = int(os.getenv("MAX_USD", "121000"))
 MAX_EXP = int(os.getenv("MAX_EXP", "120000"))
 MIN_AMB = int(os.getenv("MIN_AMB", "2"))
@@ -27,64 +36,165 @@ ZONAS_OK = {z.strip().lower() for z in os.getenv(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Sheets tabs (create if missing)
 TAB_MASTER = "MASTER"
 TAB_REVISAR = "REVISAR"
 TAB_LOG = "LOG"
+
+
+# =========================
+# Camouflage HTTP
+# =========================
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Referer": "https://www.zonaprop.com.ar/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 
 def now_utc_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def fetch(url, timeout=25):
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+def fetch(url: str, timeout: int = 25) -> str:
+    """
+    Best-effort fetch with:
+    - session cookies
+    - retries
+    - exponential-ish backoff + jitter
+    """
+    last = None
+    for attempt in range(1, 7):
+        try:
+            r = SESSION.get(url, timeout=timeout)
+            # debug line in logs (helps)
+            print(f"GET {url} -> {r.status_code}")
+
+            if r.status_code in (403, 429):
+                # backoff + jitter
+                sleep = (5 * attempt) + random.uniform(0.2, 1.8)
+                time.sleep(sleep)
+                last = f"HTTP {r.status_code}"
+                continue
+
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = repr(e)
+            time.sleep(2 * attempt + random.uniform(0.2, 1.0))
+
+    raise RuntimeError(f"Fetch failed for {url}. Last={last}")
 
 
-def parse_sitemap(xml_text):
+def warmup():
+    """
+    Warm up session by hitting robots + homepage (sometimes helps cookies/WAF).
+    """
+    try:
+        _ = fetch(ROBOTS_URL)
+        time.sleep(1.0)
+    except Exception as e:
+        print("Warmup robots failed:", e)
+
+    try:
+        _ = fetch("https://www.zonaprop.com.ar/")
+        time.sleep(1.0)
+    except Exception as e:
+        print("Warmup homepage failed:", e)
+
+
+# =========================
+# Sitemap discovery
+# =========================
+def parse_sitemap(xml_text: str):
     root = ET.fromstring(xml_text)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
     if root.tag.endswith("sitemapindex"):
-        return "index", [sm.find("sm:loc", ns).text.strip() for sm in root.findall("sm:sitemap", ns)]
+        locs = []
+        for sm in root.findall("sm:sitemap", ns):
+            loc = sm.find("sm:loc", ns).text.strip()
+            locs.append(loc)
+        return "index", locs
+
     if root.tag.endswith("urlset"):
-        return "urlset", [u.find("sm:loc", ns).text.strip() for u in root.findall("sm:url", ns)]
+        urls = []
+        for u in root.findall("sm:url", ns):
+            loc = u.find("sm:loc", ns).text.strip()
+            urls.append(loc)
+        return "urlset", urls
+
     return "unknown", []
 
 
-def get_urls_from_sitemaps(limit_sitemaps=8):
-    idx = fetch(SITEMAP_INDEX)
-    kind, sitemaps = parse_sitemap(idx)
-    if kind != "index":
-        raise RuntimeError("Sitemap index inesperado")
+def sitemaps_from_robots(robots_text: str):
+    # lines like: Sitemap: https://...
+    sm = []
+    for line in robots_text.splitlines():
+        if line.lower().startswith("sitemap:"):
+            sm.append(line.split(":", 1)[1].strip())
+    return sm
 
-    candidates = [s for s in sitemaps if "sitemap" in s.lower()]
+
+def get_urls_from_sitemaps(limit_sitemaps: int = 8):
+    """
+    Try:
+      1) sitemap index
+      2) fallback: robots.txt sitemaps
+    """
+    # Primary
+    try:
+        idx = fetch(SITEMAP_INDEX)
+        kind, sitemaps = parse_sitemap(idx)
+        if kind == "index" and sitemaps:
+            candidates = [s for s in sitemaps if "sitemap" in s.lower()]
+            return collect_urls_from_sitemaps(candidates[:limit_sitemaps])
+    except Exception as e:
+        print("SITEMAP_INDEX failed:", e)
+
+    # Fallback: robots.txt
+    robots = fetch(ROBOTS_URL)
+    sms = sitemaps_from_robots(robots)
+    if not sms:
+        raise RuntimeError("No sitemaps found in robots.txt fallback")
+
+    return collect_urls_from_sitemaps(sms[:limit_sitemaps])
+
+
+def collect_urls_from_sitemaps(sitemap_urls):
     urls = set()
-
-    for sm in candidates[:limit_sitemaps]:
-        xml = fetch(sm)
-        k, u = parse_sitemap(xml)
-        if k == "urlset":
-            urls.update(u)
+    for sm_url in sitemap_urls:
+        try:
+            xml = fetch(sm_url)
+            kind, u = parse_sitemap(xml)
+            if kind == "urlset":
+                urls.update(u)
+        except Exception as e:
+            print("Sitemap fetch failed:", sm_url, e)
         time.sleep(1.0)
-
     return sorted(urls)
 
 
 def normalize_url(url: str) -> str:
-    # removes tracking params if any (best effort)
+    # strip query params
     return url.split("?")[0].strip()
 
 
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
-
+# =========================
+# Parsing listing
+# =========================
 def extract_metrics(html: str):
     soup = BeautifulSoup(html, "lxml")
     title = (soup.title.text.strip() if soup.title else "")[:180]
-
     text = soup.get_text(" ", strip=True).lower()
 
     # ambientes
@@ -112,17 +222,17 @@ def extract_metrics(html: str):
         if s.isdigit():
             price = int(s)
 
-    # barrio/localidad: buscamos tokens
+    # barrio/localidad: tokens
     barrio = ""
     for z in ZONAS_OK:
         if z in text:
             barrio = z
             break
 
-    # tipo (heurística)
+    # tipo
     tipo = "PH" if " ph " in f" {text} " else "Depto"
 
-    # balcón/patio (heurística)
+    # balcón/patio/terraza
     balcon_patio = "S" if ("balcón" in text or "balcon" in text or "patio" in text or "terraza" in text) else "N"
 
     return {
@@ -138,11 +248,11 @@ def extract_metrics(html: str):
 
 def strict_ok(d):
     """
-    “Rigurosamente” para enviar a MASTER:
-    - barrio detectado y dentro de tu lista
-    - ambientes conocido y >= 2
-    - precio conocido y <= 121k
-    - expensas: si está, <=120k; si NO está -> REVISAR
+    STRICT to MASTER:
+    - barrio detectado
+    - amb >= 2 (conocido)
+    - price <= 121k (conocido)
+    - expensas: si falta => REVISAR (como pediste)
     """
     if not d["barrio"]:
         return False, "Falta barrio"
@@ -157,26 +267,31 @@ def strict_ok(d):
     return True, "OK"
 
 
+# =========================
+# Google Sheets
+# =========================
 def connect_sheet():
     sa_json = os.getenv("GCP_SA_JSON")
     if not sa_json:
-        raise RuntimeError("Falta secret GCP_SA_JSON")
+        raise RuntimeError("Missing secret GCP_SA_JSON")
 
     info = json.loads(sa_json)
+    print("Using service account:", info.get("client_email"))
+    print("Target sheet id:", SHEET_ID)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(creds)
-
     sh = gc.open_by_key(SHEET_ID)
 
     def get_or_create(title, headers):
         try:
             ws = sh.worksheet(title)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers)+5)
+            ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers) + 5)
             ws.append_row(headers)
         return ws
 
@@ -194,30 +309,22 @@ def connect_sheet():
     ws_master = get_or_create(TAB_MASTER, master_headers)
     ws_revisar = get_or_create(TAB_REVISAR, revisar_headers)
     ws_log = get_or_create(TAB_LOG, log_headers)
-
     return ws_master, ws_revisar, ws_log
 
 
 def load_existing_urls(ws):
-    # assumes header in row 1, url in col 1
-    vals = ws.col_values(1)
+    vals = ws.col_values(1)  # url column
     return set(v.strip() for v in vals[1:] if v.strip())
 
 
 def upsert_master(ws, url, d, ts):
-    # naive approach: find row by url (small-scale ok)
-    # For big scale, cache url->row.
     urls = ws.col_values(1)
     try:
         idx = urls.index(url)
         row = idx + 1
-        # update last_seen + current price/exp, update min/max
+
         current_price = d["price_usd"]
         current_exp = d["expensas_ars"]
-
-        price_min_cell = ws.cell(row, 14).value  # price_min
-        price_max_cell = ws.cell(row, 15).value
-        exp_min_cell = ws.cell(row, 16).value
 
         def to_int(x):
             try:
@@ -225,19 +332,18 @@ def upsert_master(ws, url, d, ts):
             except:
                 return None
 
-        pmin = to_int(price_min_cell)
-        pmax = to_int(price_max_cell)
-        emin = to_int(exp_min_cell)
+        pmin = to_int(ws.cell(row, 14).value)
+        pmax = to_int(ws.cell(row, 15).value)
+        emin = to_int(ws.cell(row, 16).value)
 
         pmin = current_price if pmin is None else min(pmin, current_price)
         pmax = current_price if pmax is None else max(pmax, current_price)
         emin = current_exp if emin is None else min(emin, current_exp)
 
-        ws.update(f"L{row}:P{row}", [[ts, "Activo", pmin, pmax, emin]])
         ws.update(f"F{row}:G{row}", [[current_price, current_exp]])
+        ws.update(f"L{row}:P{row}", [[ts, "Activo", pmin, pmax, emin]])
         return "UPDATED"
     except ValueError:
-        # insert
         ws.append_row([
             url, "Zonaprop", d["barrio"], d["tipo"], d["ambientes"], d["price_usd"], d["expensas_ars"],
             d["balcon_patio"], "Validar", d["title"],
@@ -252,7 +358,7 @@ def upsert_revisar(ws, url, d, ts, reason):
     try:
         idx = urls.index(url)
         row = idx + 1
-        ws.update(f"L{row}:L{row}", [[ts]])
+        ws.update(f"L{row}:L{row}", [[ts]])   # last_seen
         ws.update(f"J{row}:J{row}", [[reason]])
         return "UPDATED"
     except ValueError:
@@ -263,23 +369,42 @@ def upsert_revisar(ws, url, d, ts, reason):
         return "NEW"
 
 
+# =========================
+# Telegram
+# =========================
 def telegram_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured (missing secrets).")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    requests.post(url, json=payload, timeout=20)
+    try:
+        r = requests.post(api, json=payload, timeout=20)
+        print("Telegram status:", r.status_code)
+    except Exception as e:
+        print("Telegram send failed:", e)
 
 
+# =========================
+# Main
+# =========================
 def main():
-    ts = now_utc_iso()
-    ws_master, ws_revisar, ws_log = connect_sheet()
+    if not SHEET_ID:
+        raise RuntimeError("Missing SHEET_ID env")
 
+    ts = now_utc_iso()
+
+    warmup()
+
+    ws_master, ws_revisar, ws_log = connect_sheet()
     existing_master = load_existing_urls(ws_master)
     existing_revisar = load_existing_urls(ws_revisar)
 
+    # Get candidate URLs
     all_urls = get_urls_from_sitemaps()
-    # nuevas = URLs que no estén ni en master ni en revisar
+    print("Total URLs from sitemap sample:", len(all_urls))
+
+    # Only URLs not already present
     new_urls = []
     for u in all_urls:
         u0 = normalize_url(u)
@@ -287,6 +412,8 @@ def main():
             new_urls.append(u0)
         if len(new_urls) >= MAX_NEW_URLS_PER_RUN:
             break
+
+    print("New URLs to check:", len(new_urls))
 
     added_master = 0
     added_revisar = 0
@@ -303,32 +430,33 @@ def main():
                 res = upsert_master(ws_master, u, d, ts)
                 if res == "NEW":
                     added_master += 1
-                    telegram_items.append(f"- {d['barrio'].title()} | {d['tipo']} | {d['ambientes']} amb | USD {d['price_usd']} | Exp {d['expensas_ars']} | {u}")
+                    telegram_items.append(
+                        f"- {d['barrio'].title()} | {d['tipo']} | {d['ambientes']} amb | "
+                        f"USD {d['price_usd']} | Exp {d['expensas_ars']} | {u}"
+                    )
             else:
-                # REVISAR
                 upsert_revisar(ws_revisar, u, d, ts, reason)
                 added_revisar += 1
 
             time.sleep(SLEEP_SEC)
-        except Exception:
+        except Exception as e:
             errors += 1
+            print("Error on URL:", u, e)
             time.sleep(SLEEP_SEC)
 
     ws_log.append_row([ts, len(new_urls), added_master, added_revisar, errors])
 
-    # Telegram summary
+    # Telegram
     if telegram_items:
-        msg = "🏠 Nuevas oportunidades (Zonaprop) — filtros OK\n" + "\n".join(telegram_items[:10])
+        msg = "🏠 Nuevas oportunidades (Zonaprop) — OK filtros\n" + "\n".join(telegram_items[:10])
         if len(telegram_items) > 10:
-            msg += f"\n… y {len(telegram_items)-10} más en el Sheet."
+            msg += f"\n… y {len(telegram_items) - 10} más en el Sheet."
         telegram_send(msg)
     else:
-        telegram_send("📭 Zonaprop — sin nuevas oportunidades que cumplan filtros OK en esta corrida.")
+        telegram_send("📭 Zonaprop — sin nuevas oportunidades OK en esta corrida.")
 
-    print(f"Checked new: {len(new_urls)} | master+ {added_master} | revisar+ {added_revisar} | errors {errors}")
+    print(f"Done. checked={len(new_urls)} master+={added_master} revisar+={added_revisar} errors={errors}")
 
 
 if __name__ == "__main__":
-    if not SHEET_ID:
-        raise RuntimeError("Falta SHEET_ID env")
     main()
