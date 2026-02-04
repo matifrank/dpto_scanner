@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-SITEMAP_INDEX = "https://www.zonaprop.com.ar/sitemaps_https.xml"
+SITEMAP_INDEX = "https://www.zonaprop.com.ar/robots.txt"
 UA = os.getenv("UA", "Mozilla/5.0 (property-tracker/1.0)")
 HEADERS = {"User-Agent": UA}
 
