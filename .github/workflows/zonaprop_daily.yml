@@ -2,8 +2,8 @@ name: Zonaprop → Google Sheet → Telegram
 
 on:
   schedule:
-    - cron: "15 11 * * *"  # 08:15 ART
-    - cron: "15 21 * * *"  # 18:15 ART
+    #- cron: "15 11 * * *"  # 08:15 ART
+    #- cron: "15 21 * * *"  # 18:15 ART
   workflow_dispatch: {}
 
 permissions:
